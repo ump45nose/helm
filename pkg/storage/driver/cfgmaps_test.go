@@ -191,6 +191,25 @@ func TestConfigMapUpdate(t *testing.T) {
 	assert.Equal(t, got.Info.Status, rel.Info.Status, "Expected status %s, got status %s", rel.Info.Status.String(), got.Info.Status.String())
 }
 
+func TestConfigMapUpdateMissingRelease(t *testing.T) {
+	vers := 1
+	name := "smug-pigeon"
+	namespace := "default"
+	key := testKey(name, vers)
+	rel := releaseStub(name, vers, namespace, common.StatusDeployed)
+
+	cfgmaps := newTestFixtureCfgMaps(t)
+
+	rel.Info.Status = common.StatusSuperseded
+
+	err := cfgmaps.Update(key, rel)
+	assert.ErrorIsf(t, err, ErrReleaseNotFound, "expected ErrReleaseNotFound updating a release that does not exist, got %v", err)
+
+	// The update must not have created the release as a side effect.
+	_, err = cfgmaps.Get(key)
+	assert.ErrorIs(t, err, ErrReleaseNotFound, "expected %q to stay absent", key)
+}
+
 func TestConfigMapDelete(t *testing.T) {
 	vers := 1
 	name := "smug-pigeon"

@@ -14,6 +14,7 @@ limitations under the License.
 package driver
 
 import (
+	"database/sql"
 	"database/sql/driver"
 	"errors"
 	"fmt"
@@ -296,6 +297,14 @@ func TestSqlUpdate(t *testing.T) {
 	sqlDriver, mock := newTestFixtureSQL(t)
 	body, _ := encodeRelease(rel)
 
+	selectQuery := fmt.Sprintf(
+		"SELECT %s FROM %s WHERE %s = $1 AND %s = $2",
+		sqlReleaseTableBodyColumn,
+		sqlReleaseTableName,
+		sqlReleaseTableKeyColumn,
+		sqlReleaseTableNamespaceColumn,
+	)
+
 	query := fmt.Sprintf(
 		"UPDATE %s SET %s = $1, %s = $2, %s = $3, %s = $4, %s = $5, %s = $6 WHERE %s = $7 AND %s = $8",
 		sqlReleaseTableName,
@@ -309,12 +318,53 @@ func TestSqlUpdate(t *testing.T) {
 		sqlReleaseTableNamespaceColumn,
 	)
 
+	mock.ExpectBegin()
+	mock.
+		ExpectQuery(regexp.QuoteMeta(selectQuery)).
+		WithArgs(key, namespace).
+		WillReturnRows(
+			mock.NewRows([]string{
+				sqlReleaseTableBodyColumn,
+			}).AddRow(
+				body,
+			),
+		).RowsWillBeClosed()
 	mock.
 		ExpectExec(regexp.QuoteMeta(query)).
 		WithArgs(body, rel.Name, int(rel.Version), rel.Info.Status.String(), sqlReleaseDefaultOwner, recentUnixTimestamp(), key, namespace).
 		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
 
 	require.NoErrorf(t, sqlDriver.Update(key, rel), "failed to update release with key %s", key)
+	assert.NoErrorf(t, mock.ExpectationsWereMet(), "sql expectations weren't met")
+}
+
+func TestSqlUpdateMissingRelease(t *testing.T) {
+	vers := 1
+	name := "smug-pigeon"
+	namespace := "default"
+	key := testKey(name, vers)
+	rel := releaseStub(name, vers, namespace, common.StatusDeployed)
+
+	sqlDriver, mock := newTestFixtureSQL(t)
+
+	selectQuery := fmt.Sprintf(
+		"SELECT %s FROM %s WHERE %s = $1 AND %s = $2",
+		sqlReleaseTableBodyColumn,
+		sqlReleaseTableName,
+		sqlReleaseTableKeyColumn,
+		sqlReleaseTableNamespaceColumn,
+	)
+
+	mock.ExpectBegin()
+	mock.
+		ExpectQuery(regexp.QuoteMeta(selectQuery)).
+		WithArgs(key, namespace).
+		WillReturnError(sql.ErrNoRows)
+	mock.ExpectRollback()
+
+	err := sqlDriver.Update(key, rel)
+	assert.ErrorIsf(t, err, ErrReleaseNotFound, "expected ErrReleaseNotFound updating %q, got %v", key, err)
 	assert.NoErrorf(t, mock.ExpectationsWereMet(), "sql expectations weren't met")
 }
 

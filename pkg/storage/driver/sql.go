@@ -17,6 +17,8 @@ limitations under the License.
 package driver
 
 import (
+	"database/sql"
+	"errors"
 	"fmt"
 	"log/slog"
 	"maps"
@@ -575,7 +577,8 @@ func (s *SQL) Create(key string, rel release.Releaser) error {
 	return nil
 }
 
-// Update updates a release.
+// Update updates a release, or returns ErrReleaseNotFound if the release does
+// not exist.
 //
 // Custom labels on an existing revision are meant to be preserved. A release's
 // labels are set by Create, and a revision keeps the labels it was created with
@@ -607,6 +610,42 @@ func (s *SQL) Update(key string, rel release.Releaser) error {
 		return err
 	}
 
+	// An UPDATE that matches no row is not an SQL error, so the driver has to
+	// look for the row itself to honour the Updator contract. RowsAffected is
+	// deliberately not used as a proxy for it: MySQL counts rows *changed*
+	// rather than rows matched, and modifiedAt only has one-second resolution,
+	// so rewriting an identical revision twice in the same second would look
+	// like a missing release. Reading inside the writing transaction is the
+	// same shape Delete uses.
+	transaction, err := s.db.Beginx()
+	if err != nil {
+		s.Logger().Debug("failed to start SQL transaction", slog.Any("error", err))
+		return fmt.Errorf("error beginning transaction: %w", err)
+	}
+
+	selectQuery, selectArgs, err := s.statementBuilder.
+		Select(sqlReleaseTableBodyColumn).
+		From(sqlReleaseTableName).
+		Where(sq.Eq{sqlReleaseTableKeyColumn: key}).
+		Where(sq.Eq{sqlReleaseTableNamespaceColumn: namespace}).
+		ToSql()
+	if err != nil {
+		transaction.Rollback()
+		s.Logger().Debug("failed to build select query", slog.Any("error", err))
+		return err
+	}
+
+	var existing SQLReleaseWrapper
+	if err := transaction.Get(&existing, selectQuery, selectArgs...); err != nil {
+		transaction.Rollback()
+		if errors.Is(err, sql.ErrNoRows) {
+			s.Logger().Debug("release not found", slog.String("key", key))
+			return ErrReleaseNotFound
+		}
+		s.Logger().Debug("failed to get release from SQL database", slog.String("key", key), slog.Any("error", err))
+		return fmt.Errorf("update: failed to get %q: %w", key, err)
+	}
+
 	query, args, err := s.statementBuilder.
 		Update(sqlReleaseTableName).
 		Set(sqlReleaseTableBodyColumn, body).
@@ -619,13 +658,20 @@ func (s *SQL) Update(key string, rel release.Releaser) error {
 		Where(sq.Eq{sqlReleaseTableNamespaceColumn: namespace}).
 		ToSql()
 	if err != nil {
+		transaction.Rollback()
 		s.Logger().Debug("failed to build update query", slog.Any("error", err))
 		return err
 	}
 
-	if _, err := s.db.Exec(query, args...); err != nil {
+	if _, err := transaction.Exec(query, args...); err != nil {
+		transaction.Rollback()
 		s.Logger().Debug("failed to update release in SQL database", slog.String("key", key), slog.Any("error", err))
 		return err
+	}
+
+	if err := transaction.Commit(); err != nil {
+		s.Logger().Debug("failed to commit SQL update transaction", slog.String("key", key), slog.Any("error", err))
+		return fmt.Errorf("error committing transaction: %w", err)
 	}
 
 	return nil
